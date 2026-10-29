@@ -1,0 +1,283 @@
+"""King: Apna Hub ka WhatsApp business assistant.
+FastAPI + WhatsApp Cloud API + Claude. Rate/bill ka kaam code karta hai, AI nahi."""
+import hashlib, hmac, json, logging, os, re, sqlite3, threading, time
+from pathlib import Path
+
+import anthropic
+import httpx
+from dotenv import load_dotenv
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger("king")
+
+
+def env(name, default=None):
+    v = os.getenv(name, default)
+    if v is None:
+        raise RuntimeError(f"{name} .env me nahi hai")
+    return v
+
+
+VERIFY_TOKEN = env("VERIFY_TOKEN")
+APP_SECRET = env("APP_SECRET")
+WA_TOKEN = env("WA_TOKEN")
+PHONE_ID = env("PHONE_ID")
+OWNERS = {n.strip() for n in env("OWNER_NUMBERS").split(",") if n.strip()}
+MODEL = env("MODEL", "claude-sonnet-5-5")
+CITY = env("SHOP_CITY", "")
+HOURS = env("SHOP_HOURS", "")
+GRAPH = env("GRAPH_VERSION", "v21.0")
+PROMPT = (Path(__file__).parent / "prompt.txt").read_text(encoding="utf-8")
+
+client = anthropic.Anthropic()  # ANTHROPIC_API_KEY .env se
+app = FastAPI()
+
+# ---------- database (rakam paise me, integer) ----------
+LOCK = threading.Lock()
+db = sqlite3.connect(env("DB_PATH", "king.db"), check_same_thread=False)
+db.executescript("""
+CREATE TABLE IF NOT EXISTS seen(id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS rates(item TEXT PRIMARY KEY, paise INTEGER, unit TEXT, in_stock INTEGER DEFAULT 1, updated REAL);
+CREATE TABLE IF NOT EXISTS rate_log(item TEXT, paise INTEGER, unit TEXT, at REAL);
+CREATE TABLE IF NOT EXISTS pending(owner TEXT PRIMARY KEY, item TEXT, paise INTEGER, unit TEXT);
+CREATE TABLE IF NOT EXISTS customers(phone TEXT PRIMARY KEY, opted_out INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS chat(phone TEXT, role TEXT, text TEXT, at REAL);
+""")
+
+
+def q(sql, args=()):
+    with LOCK:
+        rows = db.execute(sql, args).fetchall()
+        db.commit()
+        return rows
+
+
+def first_time(mid):
+    with LOCK:
+        c = db.execute("INSERT OR IGNORE INTO seen VALUES(?)", (mid,))
+        db.commit()
+        return c.rowcount == 1
+
+
+def mask(phone):
+    return "***" + phone[-4:]
+
+
+# ---------- chhote helpers ----------
+def rs(paise):
+    return f"{paise / 100:,.2f}".rstrip("0").rstrip(".")
+
+
+def per(unit):
+    return f"/{unit}" if unit else ""
+
+
+FILLER = re.compile(r"(?<!\w)(?:ho gayi|ho gaya|hai|rs\.?|rupaye|rupay)(?!\w)")
+RATE = re.compile(r"^(?P<item>[^\d/]+?)\s+(?P<price>\d+(?:\.\d{1,2})?)\s*(?:/\s*(?P<unit>\w+))?$")
+
+
+def parse_rate(text):
+    """'chini 46 ho gayi' -> ('chini', 4600, '')"""
+    t = re.sub(r"\s+", " ", FILLER.sub(" ", text.strip().lower())).strip()
+    m = RATE.match(t)
+    if not m:
+        return None
+    return m["item"].strip(), round(float(m["price"]) * 100), (m["unit"] or "")
+
+
+def fmt_list():
+    rows = q("SELECT item,paise,unit,in_stock FROM rates ORDER BY item")
+    lines = [f"- {i}: Rs. {rs(p)}{per(u)}{'' if s else ' (stock me nahi)'}" for i, p, u, s in rows]
+    return "\n".join(lines) or "(abhi koi rate save nahi hai)"
+
+
+# ---------- WhatsApp bhejna (3 koshish, badhta gap) ----------
+def send(to, text):
+    url = f"https://graph.facebook.com/{GRAPH}/{PHONE_ID}/messages"
+    body = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text[:4000]}}
+    for i in range(3):
+        try:
+            r = httpx.post(url, json=body, headers={"Authorization": f"Bearer {WA_TOKEN}"}, timeout=15)
+            if r.status_code < 300:
+                return True
+            log.warning("send fail %s status=%s", mask(to), r.status_code)
+        except httpx.HTTPError as e:
+            log.warning("send error %s %s", mask(to), type(e).__name__)
+        time.sleep(2 ** i)
+    return False
+
+
+# ---------- AI ----------
+BILL_TOOL = {
+    "name": "bill",
+    "description": "Saman ka bill banao. Rate aur total code se judte hain, khud mat jodo.",
+    "input_schema": {"type": "object", "required": ["items"], "properties": {"items": {
+        "type": "array", "items": {"type": "object", "required": ["item", "qty"],
+        "properties": {"item": {"type": "string"}, "qty": {"type": "number"}}}}}},
+}
+
+
+def run_bill(items):
+    lines, total = [], 0
+    for it in items:
+        row = q("SELECT item,paise,in_stock FROM rates WHERE item=?", (it["item"].lower().strip(),))
+        if not row or not row[0][2]:
+            lines.append(f"{it['item']}: rate ya stock nahi mila, owner se confirm karo")
+            continue
+        name, paise, _ = row[0]
+        amt = round(paise * it["qty"])
+        total += amt
+        lines.append(f"{name} x {it['qty']:g} = Rs. {rs(amt)}")
+    return "\n".join(lines) + f"\nTotal: Rs. {rs(total)}"
+
+
+def ai(system, messages, tools=None):
+    for _ in range(5):
+        kw = {"tools": tools} if tools else {}
+        r = client.messages.create(model=MODEL, max_tokens=700, system=system, messages=messages, **kw)
+        if r.stop_reason == "pause_turn":
+            messages.append({"role": "assistant", "content": r.content})
+            continue
+        if r.stop_reason != "tool_use":
+            return "".join(b.text for b in r.content if b.type == "text").strip()
+        messages.append({"role": "assistant", "content": r.content})
+        results = [{"type": "tool_result", "tool_use_id": b.id, "content": run_bill(b.input["items"])}
+                   for b in r.content if b.type == "tool_use" and b.name == "bill"]
+        messages.append({"role": "user", "content": results})
+    return ""
+
+
+def system_prompt():
+    base = PROMPT.replace("[SHEHAR]", CITY).replace("[KHULNE-BAND HONE KA TIME]", HOURS)
+    return (f"{base}\n\nAAJ KI PRICE LIST (sirf yahi rate batao):\n{fmt_list()}\n\n"
+            "Bill banana ho to bill tool use karo, item ka naam list jaisa hi likho.")
+
+
+def history(phone):
+    rows = q("SELECT role,text FROM chat WHERE phone=? ORDER BY rowid DESC LIMIT 10", (phone,))[::-1]
+    msgs = []
+    for role, text in rows:
+        if msgs and msgs[-1]["role"] == role:
+            msgs[-1]["content"] += "\n" + text
+        elif msgs or role == "user":
+            msgs.append({"role": role, "content": text})
+    return msgs
+
+
+def market_rate(item):
+    system = (f"Tum Apna Hub ke owner ke liye market rate analyst ho. Aaj {time.strftime('%d %b %Y')} hai. "
+              f"Web search se {CITY or 'India'} ya paas ke bhav dekho. Hinglish me chhota jawab do: rate (range), "
+              "source, tareekh, brand ya quality ka fark. Pakka rate na mile ya source 7 din se purana ho to bolo "
+              "'Abhi pakka rate nahi mila'. Andaza mat lagao.")
+    tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
+    out = ai(system, [{"role": "user", "content": f"{item} ka aaj ka market rate {CITY}"}], tools)
+    return f"{out or 'Abhi pakka rate nahi mila.'}\n\nApna rate bhejiye, jaise: {item} 450"
+
+
+# ---------- owner ke commands ----------
+HELP = ("Rate badalne ke liye likhiye: chini 46 (ya chini 46/kg)\nStock khatam: chini khatam\n"
+        "Market rate: kurta ka market rate\nSab rate dekhne ke liye: list")
+
+
+def owner_cmd(owner, text):
+    t = text.strip().lower()
+    pend = q("SELECT item,paise,unit FROM pending WHERE owner=?", (owner,))
+    if pend and t in ("haan", "han", "ha", "yes", "ok"):
+        item, paise, unit = pend[0]
+        now = time.time()
+        q("INSERT INTO rates VALUES(?,?,?,1,?) ON CONFLICT(item) DO UPDATE SET paise=excluded.paise, "
+          "unit=excluded.unit, in_stock=1, updated=excluded.updated", (item, paise, unit, now))
+        q("INSERT INTO rate_log VALUES(?,?,?,?)", (item, paise, unit, now))
+        q("DELETE FROM pending WHERE owner=?", (owner,))
+        return f"Ho gaya ji. {item.title()} Rs. {rs(paise)}{per(unit)} save kar diya. 👍"
+    if pend and t in ("nahi", "no", "na"):
+        q("DELETE FROM pending WHERE owner=?", (owner,))
+        return "Theek hai ji, rate nahi badla."
+    if t == "list":
+        return fmt_list()
+    m = re.match(r"^(.+?)\s+khatam$", t)
+    if m:
+        if not q("SELECT 1 FROM rates WHERE item=?", (m[1],)):
+            return f"{m[1]} list me nahi hai."
+        q("UPDATE rates SET in_stock=0, updated=? WHERE item=?", (time.time(), m[1]))
+        return f"Ji, {m[1].title()} ko 'stock me nahi' mark kar diya."
+    m = re.search(r"market rate\s+(.+)$", t) or re.match(r"^(.+?)\s+ka market rate", t)
+    if m:
+        return market_rate(m[1].strip())
+    r = parse_rate(text)
+    if r:
+        item, paise, unit = r
+        q("INSERT INTO pending VALUES(?,?,?,?) ON CONFLICT(owner) DO UPDATE SET item=excluded.item, "
+          "paise=excluded.paise, unit=excluded.unit", (owner, item, paise, unit))
+        return f"{item.title()} ab Rs. {rs(paise)}{per(unit)}. Sahi hai? (haan/nahi)"
+    return HELP
+
+
+# ---------- customer ke messages ----------
+def customer_msg(phone, text):
+    t = text.strip().lower()
+    if t in ("stop", "unsubscribe"):
+        q("INSERT INTO customers VALUES(?,1) ON CONFLICT(phone) DO UPDATE SET opted_out=1", (phone,))
+        return send(phone, "Theek hai ji, ab aapko promotion message nahi bhejenge. Zaroorat ho to kabhi bhi message kijiye.")
+    if t == "start":
+        q("INSERT INTO customers VALUES(?,0) ON CONFLICT(phone) DO UPDATE SET opted_out=0", (phone,))
+        return send(phone, "Dhanyavaad ji! Ab aapko hamare offer ke message milenge.")
+    if q("SELECT COUNT(*) FROM chat WHERE phone=? AND role='user' AND at>?", (phone, time.time() - 3600))[0][0] >= 30:
+        return
+    q("INSERT INTO chat VALUES(?,?,?,?)", (phone, "user", text[:1000], time.time()))
+    reply = ai(system_prompt(), history(phone), [BILL_TOOL])
+    handoff = "[OWNER]" in reply
+    reply = reply.replace("[OWNER]", "").strip() or "Ji, main dukan malik se confirm karke abhi batata hoon."
+    q("INSERT INTO chat VALUES(?,?,?,?)", (phone, "assistant", reply, time.time()))
+    send(phone, reply)
+    if handoff:
+        for o in OWNERS:
+            send(o, f"King ko madad chahiye.\nCustomer: +{phone}\nMessage: {text[:300]}")
+
+
+def handle(m):
+    phone = m.get("from", "")
+    try:
+        if not first_time(m["id"]):
+            return
+        if m.get("type") != "text":
+            send(phone, "Ji, abhi main sirf likhe hue message samajh pata hoon. Kripya likh kar bataiye.")
+            return
+        text = m["text"]["body"]
+        if phone in OWNERS:
+            send(phone, owner_cmd(phone, text))
+        else:
+            customer_msg(phone, text)
+    except Exception:
+        log.exception("handle fail %s", mask(phone))
+        send(phone, "Maaf kijiye ji, abhi thodi dikkat aa gayi. Dukan malik jaldi aapse baat karenge.")
+        for o in OWNERS:
+            send(o, f"King me error aaya (customer ***{phone[-4:]}). Log dekhiye.")
+
+
+# ---------- webhook ----------
+def valid_sig(body, header):
+    mac = hmac.new(APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest("sha256=" + mac, header or "")
+
+
+@app.get("/webhook")
+def verify(request: Request):
+    p = request.query_params
+    if p.get("hub.mode") == "subscribe" and hmac.compare_digest(p.get("hub.verify_token", ""), VERIFY_TOKEN):
+        return Response(p.get("hub.challenge", ""), media_type="text/plain")
+    raise HTTPException(403)
+
+
+@app.post("/webhook")
+async def incoming(request: Request, bg: BackgroundTasks):
+    body = await request.body()
+    if not valid_sig(body, request.headers.get("x-hub-signature-256")):
+        raise HTTPException(403)
+    for entry in json.loads(body).get("entry", []):
+        for change in entry.get("changes", []):
+            for m in change.get("value", {}).get("messages", []):
+                bg.add_task(handle, m)
+    return {"ok": True}  # jaldi 200, kaam background me
